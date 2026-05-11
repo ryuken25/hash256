@@ -84,8 +84,13 @@ if ! pgrep -x tailscaled >/dev/null 2>&1; then
 fi
 
 echo ""
-echo "[setup] tailscale up — kalau muncul auth URL, buka di browser laptop dan approve device ini."
-tailscale up --accept-dns=false || true
+if [ -n "${TS_AUTHKEY:-}" ]; then
+  echo "[setup] tailscale up dengan auth key (non-interactive)"
+  tailscale up --accept-dns=false --authkey="$TS_AUTHKEY" --hostname="$(hostname)" || true
+else
+  echo "[setup] tailscale up — kalau muncul auth URL, buka di browser laptop dan approve device ini."
+  tailscale up --accept-dns=false || true
+fi
 echo ""
 echo "[setup] tailscale status:"
 tailscale status || true
