@@ -166,6 +166,23 @@ esac
 # Build "0,1,2,..." sampai GPU_COUNT
 GPU_INDICES=$(seq -s, 0 $((GPU_COUNT-1)))
 
+# Ensure NVIDIA OpenCL ICD vendor file exists. Some vast.ai images install
+# pocl (CPU OpenCL) but never write /etc/OpenCL/vendors/nvidia.icd, so OpenCL
+# apps see only the CPU device and ignore the GPU.
+if command -v nvidia-smi >/dev/null 2>&1 && [ -f /usr/lib/x86_64-linux-gnu/libnvidia-opencl.so.1 ]; then
+  mkdir -p /etc/OpenCL/vendors
+  if [ ! -f /etc/OpenCL/vendors/nvidia.icd ]; then
+    echo "[setup] writing /etc/OpenCL/vendors/nvidia.icd"
+    echo "libnvidia-opencl.so.1" > /etc/OpenCL/vendors/nvidia.icd
+  fi
+  # If pocl ICD is also present and would dominate, move it aside so the GPU
+  # platform shows up as the default (worker uses platform[0]).
+  if [ -f /etc/OpenCL/vendors/pocl.icd ]; then
+    mv /etc/OpenCL/vendors/pocl.icd /etc/OpenCL/vendors/pocl.icd.disabled
+    echo "[setup] disabled /etc/OpenCL/vendors/pocl.icd (CPU OpenCL would override GPU)"
+  fi
+fi
+
 # OpenCL self-check
 echo ""
 echo "[setup] OpenCL devices:"
@@ -224,9 +241,13 @@ echo "   MINER_ID      = $HOSTNAME_ID"
 echo "   COORDINATOR   = $COORDINATOR_URL"
 echo "============================================================="
 
-# ---- 7. Run worker di screen ------------------------------------------------
-# Kill session lama kalau ada supaya bisa re-run skrip dengan aman.
+# ---- 7. Run worker via nohup (more reliable than screen on vast.ai images) -
+# Some vast.ai container images kill detached screen sessions after a while.
+# nohup + setsid + disown gives us a process that survives the SSH session
+# terminating. Logs go to worker.log; check with `tail -f worker.log`.
+pkill -9 -f 'target/release/hash256 worker' 2>/dev/null || true
 screen -S hash256-worker -X quit 2>/dev/null || true
+sleep 1
 
 PROXY_ENV=""
 if [ "$USE_USERSPACE" = "1" ]; then
@@ -234,15 +255,26 @@ if [ "$USE_USERSPACE" = "1" ]; then
   echo "[setup] worker akan pakai HTTP proxy localhost:1055 (Tailscale userspace mode)"
 fi
 
-screen -dmS hash256-worker bash -lc \
-  "cd $WORK_DIR/hash256 && $PROXY_ENV set -a && . ./.env && set +a && ./target/release/hash256 worker 2>&1 | tee -a worker.log"
+cd "$WORK_DIR/hash256"
+setsid nohup bash -c "
+  $PROXY_ENV
+  set -a; . ./.env; set +a
+  exec ./target/release/hash256 worker 2>&1
+" > "$WORK_DIR/hash256/worker.log" 2>&1 < /dev/null &
+disown 2>/dev/null || true
+sleep 5
 
-sleep 1
-screen -ls || true
-
-echo ""
-echo "[setup] worker started in screen 'hash256-worker'."
-echo "    lihat log live :  screen -r hash256-worker     (detach: Ctrl+A D)"
-echo "    tail file log  :  tail -f $WORK_DIR/hash256/worker.log"
-echo "    stop worker    :  screen -S hash256-worker -X quit"
-echo "    re-run setup   :  bash $WORK_DIR/hash256/scripts/setup_worker.sh"
+WORKER_PID=$(pgrep -f 'target/release/hash256 worker' | head -1)
+if [ -n "$WORKER_PID" ]; then
+  echo ""
+  echo "[setup] worker started (pid=$WORKER_PID, nohup)"
+  echo "    tail log  :  tail -f $WORK_DIR/hash256/worker.log"
+  echo "    stop      :  pkill -f 'target/release/hash256 worker'"
+  echo "    re-run    :  bash $WORK_DIR/hash256/scripts/setup_worker.sh"
+  echo ""
+  echo "[setup] last 5 lines of worker log:"
+  tail -5 "$WORK_DIR/hash256/worker.log"
+else
+  echo "[setup] WARNING: worker process not found after 5s. Check $WORK_DIR/hash256/worker.log"
+  tail -20 "$WORK_DIR/hash256/worker.log"
+fi
