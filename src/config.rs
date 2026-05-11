@@ -55,6 +55,13 @@ pub struct AppConfig {
     pub metrics_bind: String,
     pub enable_parallel_pending_tx: bool,
     pub auto_tune_target_ms: u64,
+    /// Bump priority to this gwei when blocks_left < late_epoch_threshold_blocks
+    /// to guarantee inclusion before challenge changes. 0 = disabled.
+    pub late_epoch_priority_gwei: f64,
+    /// Trigger threshold for late-epoch gas bump.
+    pub late_epoch_threshold_blocks: u64,
+    /// Skip eth_call simulate after first successful tx (saves ~300ms latency).
+    pub skip_simulate_after_success: bool,
 }
 
 impl AppConfig {
@@ -117,6 +124,9 @@ impl AppConfig {
             metrics_bind: env_s("METRICS_BIND", "0.0.0.0:9898"),
             enable_parallel_pending_tx: env_bool("ENABLE_PARALLEL_PENDING_TX", false),
             auto_tune_target_ms: env_parse("AUTO_TUNE_TARGET_MS", 250u64),
+            late_epoch_priority_gwei: env_parse("LATE_EPOCH_PRIORITY_GWEI", 0.0f64),
+            late_epoch_threshold_blocks: env_parse("LATE_EPOCH_THRESHOLD_BLOCKS", 5u64),
+            skip_simulate_after_success: env_bool("SKIP_SIMULATE_AFTER_SUCCESS", false),
         })
     }
 

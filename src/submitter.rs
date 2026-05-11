@@ -51,6 +51,9 @@ pub struct Submitter {
     miner_address: Address,
     metrics: Arc<Metrics>,
     pending_lock: Mutex<()>,
+    /// Set to true after first successful broadcast, used to skip eth_call
+    /// simulate on subsequent submissions when SKIP_SIMULATE_AFTER_SUCCESS=true.
+    had_success: std::sync::atomic::AtomicBool,
 }
 
 impl Submitter {
@@ -70,6 +73,7 @@ impl Submitter {
             miner_address,
             metrics,
             pending_lock: Mutex::new(()),
+            had_success: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -136,24 +140,45 @@ impl Submitter {
         signer: &PrivateKeySigner,
     ) -> Result<SolutionResult> {
         let calldata = mine_calldata(sol.nonce);
-        let fee = self.rpc.fee_history(4).await.ok();
-        let base_fee = fee.as_ref().map(|f| f.base_fee_per_gas);
-        // Simulate with explicit gas to avoid RPC balance preflight bugs.
-        self.rpc
-            .eth_call_tx(self.miner_address, self.cfg.contract, &calldata, 200_000)
-            .await
-            .map_err(|e| eyre!("eth_call simulate failed: {e}"))?;
-        let estimated = self
-            .rpc
-            .estimate_gas(
+        // Simulate only if not yet had success OR explicit safety mode.
+        // Skipping after first success drops latency by ~300ms (one RPC roundtrip).
+        let skip_sim = self.cfg.skip_simulate_after_success
+            && self.had_success.load(Ordering::Relaxed);
+        if !skip_sim {
+            self.rpc
+                .eth_call_tx(self.miner_address, self.cfg.contract, &calldata, 200_000)
+                .await
+                .map_err(|e| eyre!("eth_call simulate failed: {e}"))?;
+        }
+        // Fetch base fee + estimate in parallel (saves another roundtrip).
+        let (fee, estimated) = tokio::join!(
+            self.rpc.fee_history(4),
+            self.rpc.estimate_gas(
                 self.miner_address,
                 self.cfg.contract,
                 &calldata,
                 self.cfg.gas_limit_cap,
             )
-            .await
-            .ok();
-        let gas = plan_gas(&self.cfg, base_fee, estimated.or(Some(200_000)));
+        );
+        let base_fee = fee.ok().map(|f| f.base_fee_per_gas);
+        let estimated = estimated.ok();
+        let mut gas = plan_gas(&self.cfg, base_fee, estimated.or(Some(200_000)));
+        // Late-epoch aggressive bump: ensure inclusion before challenge changes.
+        if self.cfg.late_epoch_priority_gwei > 0.0
+            && state.blocks_left <= self.cfg.late_epoch_threshold_blocks
+        {
+            let bumped_priority = gwei_to_wei(self.cfg.late_epoch_priority_gwei);
+            let bumped_max = bumped_priority.saturating_add(base_fee.unwrap_or(0).saturating_mul(2));
+            if bumped_priority > gas.max_priority_fee_per_gas {
+                tracing::info!(
+                    blocks_left = state.blocks_left,
+                    bump_to_gwei = self.cfg.late_epoch_priority_gwei,
+                    "late-epoch gas bump"
+                );
+                gas.max_priority_fee_per_gas = bumped_priority;
+                gas.max_fee_per_gas = bumped_max.max(gas.max_fee_per_gas);
+            }
+        }
         let tx_nonce = mgr
             .allocate(
                 &calldata,
@@ -176,6 +201,7 @@ impl Submitter {
         let hash_str = format!("0x{}", hex::encode(tx_hash));
         mgr.db().update_tx_hash(tx_nonce, &hash_str)?;
         self.metrics.submitted_txs.fetch_add(1, Ordering::Relaxed);
+        self.had_success.store(true, Ordering::Relaxed);
         if !outcome.errors.is_empty() {
             self.metrics
                 .broadcast_errors

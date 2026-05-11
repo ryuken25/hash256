@@ -170,5 +170,8 @@ fn fake_cfg() -> AppConfig {
         metrics_bind: "127.0.0.1:9898".into(),
         enable_parallel_pending_tx: false,
         auto_tune_target_ms: 250,
+        late_epoch_priority_gwei: 0.0,
+        late_epoch_threshold_blocks: 5,
+        skip_simulate_after_success: false,
     }
 }
