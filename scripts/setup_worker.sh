@@ -50,11 +50,23 @@ fi
 systemctl start tailscaled 2>/dev/null || true
 if ! pgrep -x tailscaled >/dev/null 2>&1; then
   mkdir -p /var/lib/tailscale /var/run/tailscale
-  nohup tailscaled \
+  # Start tailscaled detached so it survives this shell exiting (vast.ai
+  # / runpod containers usually don't have systemd).
+  setsid nohup tailscaled \
     --state=/var/lib/tailscale/tailscaled.state \
     --socket=/var/run/tailscale/tailscaled.sock \
-    > /tmp/tailscaled.log 2>&1 &
-  sleep 3
+    > /tmp/tailscaled.log 2>&1 < /dev/null &
+  disown 2>/dev/null || true
+  # Wait for socket to appear
+  for i in 1 2 3 4 5 6 7 8 9 10; do
+    [ -S /var/run/tailscale/tailscaled.sock ] && break
+    sleep 1
+  done
+fi
+if ! pgrep -x tailscaled >/dev/null 2>&1; then
+  echo "WARNING: tailscaled belum jalan. Coba manual:"
+  echo "  setsid nohup tailscaled --state=/var/lib/tailscale/tailscaled.state \\"
+  echo "    --socket=/var/run/tailscale/tailscaled.sock > /tmp/tailscaled.log 2>&1 &"
 fi
 
 echo ""
