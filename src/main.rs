@@ -1,485 +1,573 @@
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
-
-use alloy::network::EthereumWallet;
-use alloy::primitives::{address, keccak256, Address, B256, U256};
-use alloy::providers::{Provider, ProviderBuilder};
-use alloy::signers::local::PrivateKeySigner;
-use alloy::sol;
-use eyre::{eyre, Result};
-use rand::Rng;
+mod cli;
+mod config;
+mod contract;
+mod coordinator;
+mod db;
+mod errors;
+mod gas;
+mod metrics;
+mod nonce_space;
+mod rpc_pool;
+mod state_watcher;
+mod submitter;
+mod tx_nonce_manager;
+mod worker;
 
 #[cfg(feature = "gpu")]
 mod gpu;
 
-const HASH_CONTRACT_ADDRESS: Address = address!("AC7b5d06fa1e77D08aea40d46cB7C5923A87A0cc");
-const DEFAULT_RPC_URL: &str = "https://eth.llamarpc.com";
-const EPOCH_BLOCKS: u64 = 100; // matches contract constant
-const EPOCH_POLL_INTERVAL: Duration = Duration::from_secs(15);
-const STATS_INTERVAL: Duration = Duration::from_secs(2);
-const ERA_MINTS: u64 = 100_000;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
-sol! {
-    #[sol(rpc)]
-    contract HashToken {
-        // Public storage getters
-        function currentDifficulty() external view returns (uint256);
-        function totalMints() external view returns (uint256);
-        function totalMiningMinted() external view returns (uint256);
-        function genesisComplete() external view returns (bool);
+use alloy::primitives::{Address, B256, U256};
+use alloy::signers::local::PrivateKeySigner;
+use clap::Parser;
+use eyre::{eyre, Result};
 
-        // Helpers
-        function getChallenge(address miner) external view returns (bytes32);
-        function epochBlocksLeft() external view returns (uint256);
-        function currentReward() external view returns (uint256);
-        function miningState() external view returns (
-            uint256 era,
-            uint256 reward,
-            uint256 difficulty,
-            uint256 minted,
-            uint256 remaining,
-            uint256 epoch,
-            uint256 epochBlocksLeft
-        );
-
-        // Mining entry-point: NO challenge arg, contract recomputes it.
-        function mine(uint256 nonce) external;
-
-        // ERC20
-        function totalSupply() external view returns (uint256);
-    }
-}
-
-struct Solution {
-    nonce: U256,
-    epoch: u64,
-}
-
-#[inline]
-fn check_proof(challenge: &B256, nonce: U256, difficulty: U256) -> bool {
-    // Contract: keccak256(abi.encode(bytes32 challenge, uint256 nonce))
-    // For bytes32 + uint256, abi.encode produces exactly 64 packed bytes
-    // (each field is already 32 bytes, no padding needed).
-    let mut buf = [0u8; 64];
-    buf[..32].copy_from_slice(challenge.as_slice());
-    buf[32..].copy_from_slice(&nonce.to_be_bytes::<32>());
-    let hash = keccak256(buf);
-    U256::from_be_bytes::<32>(hash.0) < difficulty
-}
-
-/// Run N CPU workers in a scoped thread pool. Each thread iterates nonces with
-/// stride = num_threads so no two threads ever hash the same nonce.
-fn run_workers(
-    challenge: B256,
-    difficulty: U256,
-    epoch: u64,
-    start_nonce: U256,
-    stop_flag: Arc<AtomicBool>,
-    attempts_counter: Arc<AtomicU64>,
-    num_threads: usize,
-) -> Option<Solution> {
-    let solution_slot: Mutex<Option<Solution>> = Mutex::new(None);
-    let stride = U256::from(num_threads);
-
-    std::thread::scope(|s| {
-        for tid in 0..num_threads {
-            let stop_flag = &stop_flag;
-            let attempts_counter = &attempts_counter;
-            let solution_slot = &solution_slot;
-            s.spawn(move || {
-                let mut nonce = start_nonce + U256::from(tid);
-                let mut local_attempts: u64 = 0;
-                loop {
-                    if check_proof(&challenge, nonce, difficulty) {
-                        let mut slot = solution_slot.lock().unwrap();
-                        if slot.is_none() {
-                            *slot = Some(Solution { nonce, epoch });
-                        }
-                        stop_flag.store(true, Ordering::Relaxed);
-                        attempts_counter.fetch_add(local_attempts, Ordering::Relaxed);
-                        return;
-                    }
-                    nonce += stride;
-                    local_attempts += 1;
-
-                    if local_attempts & 0x3FFF == 0 {
-                        attempts_counter.fetch_add(local_attempts, Ordering::Relaxed);
-                        local_attempts = 0;
-                        if stop_flag.load(Ordering::Relaxed) {
-                            return;
-                        }
-                    }
-                }
-            });
-        }
-    });
-
-    solution_slot.into_inner().ok().flatten()
-}
-
-fn reward_for_total_mints(total_mints: U256) -> u128 {
-    let era = total_mints / U256::from(ERA_MINTS);
-    if era < U256::from(64u64) {
-        100u128 >> era.to::<u128>().min(63)
-    } else {
-        0
-    }
-}
-
-fn hex_short(bytes: &[u8]) -> String {
-    let mut s = String::with_capacity(16);
-    for b in bytes.iter().take(8) {
-        s.push_str(&format!("{:02x}", b));
-    }
-    s
-}
+use crate::cli::{Cli, Command};
+use crate::config::{AppConfig, Mode};
+use crate::contract::{hash_nonce, hex_b256, proof_is_valid};
+use crate::coordinator::CoordinatorApp;
+use crate::db::Db;
+use crate::metrics::Metrics;
+use crate::rpc_pool::RpcPool;
+use crate::state_watcher::StateWatcher;
+use crate::submitter::{SolutionSubmit, Submitter};
+use crate::tx_nonce_manager::TxNonceManager;
 
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> Result<()> {
-    // Load .env if present (ignore if missing — env vars still work).
-    let _ = dotenvy::dotenv();
-
-    println!("🔐 HASH Token CPU Miner (Rust)");
-    println!("================================\n");
-
-    let raw_key = match std::env::var("PRIVATE_KEY") {
-        Ok(v) => v,
-        Err(_) => {
-            println!("⚠️  No PRIVATE_KEY env var found.");
-            rpassword::prompt_password("Private Key: ")?
-        }
-    };
-    let key_trimmed = raw_key.trim().trim_start_matches("0x");
-    if key_trimmed.len() != 64 {
-        return Err(eyre!("Invalid private key length (expected 64 hex chars)"));
+    let cfg = AppConfig::from_env()?;
+    init_tracing();
+    let cli = Cli::parse();
+    match cli.command.unwrap_or(match cfg.mode {
+        Mode::Standalone => Command::Mine,
+        Mode::Coordinator => Command::Coordinator,
+        Mode::Worker => Command::Worker,
+    }) {
+        Command::Devices => devices().await,
+        Command::State => state(cfg).await,
+        Command::Bench => bench(cfg).await,
+        Command::Verify { nonce } => verify(cfg, &nonce).await,
+        Command::Mine => standalone_mine(cfg).await,
+        Command::Coordinator => run_coordinator(cfg).await,
+        Command::Worker => worker::run_worker(cfg).await,
+        Command::Txs => txs(cfg).await,
+        Command::Doctor => doctor(cfg).await,
     }
-    let signer: PrivateKeySigner = key_trimmed.parse()?;
-    let miner_address = signer.address();
-    let wallet = EthereumWallet::from(signer);
+}
 
-    let rpc_url_str = std::env::var("RPC_URL").unwrap_or_else(|_| DEFAULT_RPC_URL.to_string());
-    let provider = ProviderBuilder::new()
-        .with_recommended_fillers()
-        .wallet(wallet)
-        .on_http(rpc_url_str.parse()?);
-
-    let contract = HashToken::new(HASH_CONTRACT_ADDRESS, provider.clone());
-
-    let num_threads = std::env::var("MINER_THREADS")
-        .ok()
-        .and_then(|s| s.parse::<usize>().ok())
-        .unwrap_or_else(num_cpus::get);
-
-    println!("🔨 HASH Miner initialized");
-    println!("📍 Miner Address: {}", miner_address);
-    println!("⛽ RPC URL: {}", rpc_url_str);
-    println!("🧵 Worker threads: {}", num_threads);
-
-    // --- Initial info via miningState() (one RPC call instead of four) ---
-    match contract.miningState().call().await {
-        Ok(s) => {
-            println!("\n📋 Mining State:");
-            println!("   Era: {}", s.era);
-            println!("   Reward: {} (raw, 1e18)", s.reward);
-            println!("   Difficulty: {}", s.difficulty);
-            println!("   Mining minted: {} / {}", s.minted, s.minted + s.remaining);
-            println!("   Current epoch: {}", s.epoch);
-            println!("   Blocks left in epoch: {}", s.epochBlocksLeft);
-        }
-        Err(e) => eprintln!("⚠️  miningState() failed: {e}"),
-    }
-
-    // Refuse to mine if genesis isn't complete — saves gas on guaranteed reverts.
-    match contract.genesisComplete().call().await {
-        Ok(g) if !g._0 => {
-            return Err(eyre!(
-                "Genesis is not complete yet — mining is closed. Check https://hash256.org/mine"
-            ));
-        }
-        Ok(_) => println!("✅ Genesis complete — mining is open"),
-        Err(e) => eprintln!("⚠️  Could not verify genesisComplete: {e}"),
-    }
-
-    // --- Optional GPU backend ---
-    let gpu_enabled = std::env::var("GPU").ok().as_deref() == Some("1");
-    #[cfg(feature = "gpu")]
-    let gpu_miner: Option<Arc<gpu::GpuMiner>> = if gpu_enabled {
-        let batch = std::env::var("GPU_BATCH")
-            .ok()
-            .and_then(|s| s.parse::<usize>().ok());
-        match gpu::GpuMiner::new(batch) {
-            Ok(g) => {
-                println!("🎮 GPU device: {}", g.device_name());
-                println!("🎮 GPU batch size: {} nonces/dispatch", g.batch_size());
-                match g.self_test() {
-                    Ok(()) => println!("✅ GPU self-test passed"),
-                    Err(e) => return Err(eyre!("GPU self-test FAILED — aborting: {e}")),
-                }
-                Some(Arc::new(g))
-            }
-            Err(e) => {
-                eprintln!("⚠️  GPU init failed, falling back to CPU: {e}");
-                None
-            }
-        }
+fn init_tracing() {
+    let json = std::env::var("JSON_LOGS").ok().as_deref() == Some("true");
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| "info".into());
+    if json {
+        tracing_subscriber::fmt()
+            .with_env_filter(filter)
+            .json()
+            .init();
     } else {
-        None
-    };
-    #[cfg(not(feature = "gpu"))]
-    let gpu_miner: Option<()> = {
-        if gpu_enabled {
-            eprintln!("⚠️  GPU=1 set but binary built without the `gpu` feature. Using CPU.");
-        }
-        None
-    };
+        tracing_subscriber::fmt().with_env_filter(filter).init();
+    }
+}
 
-    let shutdown = Arc::new(AtomicBool::new(false));
+async fn make_pool(cfg: &AppConfig) -> Result<RpcPool> {
+    let pool = RpcPool::new(
+        cfg.rpc_urls.clone(),
+        cfg.rpc_submit_urls.clone(),
+        cfg.rpc_timeout_sec,
+        cfg.chain_id,
+        cfg.rpc_max_block_lag,
+    )?;
+    pool.refresh_health().await;
+    pool.spawn_health_loop(cfg.rpc_health_interval_sec);
+    Ok(pool)
+}
+
+fn signer_from_cfg(cfg: &AppConfig) -> Result<PrivateKeySigner> {
+    let raw = cfg
+        .private_key
+        .clone()
+        .ok_or_else(|| eyre!("PRIVATE_KEY or PRIVATE_KEY_FILE required"))?;
+    let key = raw.trim().trim_start_matches("0x");
+    if key.len() != 64 {
+        return Err(eyre!("invalid private key length"));
+    }
+    Ok(key.parse()?)
+}
+
+async fn devices() -> Result<()> {
+    #[cfg(feature = "gpu")]
     {
-        let shutdown = Arc::clone(&shutdown);
+        gpu::list_devices()?;
+    }
+    #[cfg(not(feature = "gpu"))]
+    {
+        println!("binary built without gpu feature");
+    }
+    Ok(())
+}
+
+async fn state(cfg: AppConfig) -> Result<()> {
+    let pool = make_pool(&cfg).await?;
+    let miner = if let Some(addr) = cfg.miner_address {
+        addr
+    } else {
+        signer_from_cfg(&cfg)?.address()
+    };
+    let block = pool.block_number().await?;
+    let st = pool.mining_state(cfg.contract).await?;
+    let challenge = pool.get_challenge(cfg.contract, miner).await?;
+    let eff = cfg.effective_target(st.difficulty);
+    let bal = pool.balance(miner).await.unwrap_or(U256::ZERO);
+    println!("miner_address={miner:#x}");
+    println!("balance_wei={bal}");
+    println!("block={block}");
+    println!("epoch={}", st.epoch);
+    println!("blocks_left={}", st.epoch_blocks_left);
+    println!("challenge={}", hex_b256(&challenge));
+    println!("target={}", st.difficulty);
+    println!("effective_target={eff}");
+    Ok(())
+}
+
+async fn bench(cfg: AppConfig) -> Result<()> {
+    let challenge = B256::from([7u8; 32]);
+    let target = U256::MAX / U256::from(1024u64);
+    let attempts = Arc::new(AtomicU64::new(0));
+    let stop = Arc::new(AtomicBool::new(false));
+    let start = Instant::now();
+    #[cfg(feature = "gpu")]
+    if cfg.gpu {
+        let mut g = gpu::GpuMiner::new_for_index(
+            cfg.gpu_indices.first().copied().unwrap_or(0),
+            Some(cfg.gpu_batch as usize),
+            cfg.auto_tune_batch,
+            cfg.auto_tune_target_ms,
+            cfg.local_size,
+        )?;
+        let _stop_thread = std::thread::spawn({
+            let stop = stop.clone();
+            move || {
+                std::thread::sleep(std::time::Duration::from_secs(5));
+                stop.store(true, Ordering::Relaxed);
+            }
+        });
+        let _ = g.mine(challenge, target, 0, stop, attempts.clone())?;
+        let rate = attempts.load(Ordering::Relaxed) as f64 / start.elapsed().as_secs_f64();
+        println!(
+            "device={} attempts={} hashrate={:.2} H/s",
+            g.device_name(),
+            attempts.load(Ordering::Relaxed),
+            rate
+        );
+        return Ok(());
+    }
+    cpu_bench(challenge, target, attempts, start);
+    Ok(())
+}
+
+fn cpu_bench(challenge: B256, target: U256, attempts: Arc<AtomicU64>, start: Instant) {
+    let until = std::time::Duration::from_secs(5);
+    let mut nonce = U256::ZERO;
+    while start.elapsed() < until {
+        let _ = proof_is_valid(&challenge, nonce, target);
+        nonce += U256::from(1u64);
+        attempts.fetch_add(1, Ordering::Relaxed);
+    }
+    let rate = attempts.load(Ordering::Relaxed) as f64 / start.elapsed().as_secs_f64();
+    println!(
+        "cpu attempts={} hashrate={rate:.2} H/s",
+        attempts.load(Ordering::Relaxed)
+    );
+}
+
+async fn verify(cfg: AppConfig, nonce: &str) -> Result<()> {
+    let pool = make_pool(&cfg).await?;
+    let miner = cfg
+        .miner_address
+        .or_else(|| signer_from_cfg(&cfg).ok().map(|s| s.address()))
+        .ok_or_else(|| eyre!("set MINER_ADDRESS or PRIVATE_KEY"))?;
+    let st = pool.mining_state(cfg.contract).await?;
+    let challenge = pool.get_challenge(cfg.contract, miner).await?;
+    let pow_nonce = parse_u256(nonce)?;
+    let hash = hash_nonce(&challenge, pow_nonce);
+    println!("hash={}", hex_b256(&hash));
+    println!(
+        "valid_target={}",
+        proof_is_valid(&challenge, pow_nonce, st.difficulty)
+    );
+    println!(
+        "valid_effective_target={}",
+        proof_is_valid(&challenge, pow_nonce, cfg.effective_target(st.difficulty))
+    );
+    Ok(())
+}
+
+async fn standalone_mine(cfg: AppConfig) -> Result<()> {
+    let signer = signer_from_cfg(&cfg)?;
+    let miner = signer.address();
+    println!("standalone miner={miner:#x} contract={:#x}", cfg.contract);
+    let pool = make_pool(&cfg).await?;
+    let db = Db::open(&cfg.sqlite_path)?;
+    let tx_mgr = TxNonceManager::new(miner, &pool, db).await?;
+    let metrics = Arc::new(Metrics::default());
+    let watcher = StateWatcher::new(cfg.clone(), pool.clone(), miner);
+    let submitter = Arc::new(Submitter::new(
+        cfg.clone(),
+        pool.clone(),
+        Some(tx_mgr),
+        Some(signer),
+        miner,
+        metrics.clone(),
+    ));
+
+    // Spawn watcher.
+    {
+        let w = watcher.clone();
+        tokio::spawn(async move { w.run().await });
+    }
+    // Background tasks.
+    {
+        let s = submitter.clone();
+        tokio::spawn(async move { s.receipt_watcher_loop().await });
+        let s = submitter.clone();
+        tokio::spawn(async move { s.replacement_loop().await });
+    }
+    // Metrics server.
+    {
+        let m = metrics.clone();
+        let bind = cfg.metrics_bind.clone();
         tokio::spawn(async move {
-            if tokio::signal::ctrl_c().await.is_ok() {
-                println!("\n🛑 Ctrl-C received, stopping after current attempt...");
-                shutdown.store(true, Ordering::Relaxed);
+            if let Err(e) = crate::metrics::serve_metrics(bind, m).await {
+                tracing::warn!("metrics server: {e}");
             }
         });
     }
 
-    let session_start = Instant::now();
-    let mut session_attempts: u64 = 0;
-    let mut success_count: u64 = 0;
-
-    while !shutdown.load(Ordering::Relaxed) {
-        // --- Determine current epoch from block number ---
-        let block_num = match provider.get_block_number().await {
-            Ok(n) => n,
-            Err(e) => {
-                eprintln!("❌ RPC error fetching block number: {e}");
-                tokio::time::sleep(Duration::from_secs(5)).await;
-                continue;
+    // Wait for first state.
+    {
+        let mut rx = watcher.subscribe();
+        tracing::info!("waiting for initial chain state...");
+        loop {
+            if rx.borrow().is_some() {
+                break;
             }
-        };
-        let epoch: u64 = block_num / EPOCH_BLOCKS;
-
-        // --- Fetch challenge from contract (avoids any encoding mistakes) ---
-        let challenge = match contract.getChallenge(miner_address).call().await {
-            Ok(v) => v._0,
-            Err(e) => {
-                eprintln!("❌ RPC error fetching challenge: {e}");
-                tokio::time::sleep(Duration::from_secs(5)).await;
-                continue;
+            if rx.changed().await.is_err() {
+                return Err(eyre!("state watcher closed"));
             }
-        };
-
-        let difficulty = match contract.currentDifficulty().call().await {
-            Ok(v) => v._0,
-            Err(e) => {
-                eprintln!("❌ RPC error fetching difficulty: {e}");
-                tokio::time::sleep(Duration::from_secs(5)).await;
-                continue;
-            }
-        };
-
-        let backend = if gpu_miner.is_some() { "GPU" } else { "CPU" };
-        println!("\n📊 Round start:");
-        println!("   Block: {}  Epoch: {}", block_num, epoch);
-        println!("   Difficulty: {}", difficulty);
-        println!("   Challenge: 0x{}...", hex_short(challenge.as_slice()));
-        println!("⛏️  Mining epoch {} on {} ({} threads)...", epoch, backend, num_threads);
-
-        // u64 random start works for both backends; CPU widens via U256::from.
-        let start_nonce_u64: u64 = rand::thread_rng().gen();
-        let start_nonce = U256::from(start_nonce_u64);
-
-        let stop_flag = Arc::new(AtomicBool::new(false));
-        let attempts_counter = Arc::new(AtomicU64::new(0));
-
-        // --- Watchdog: stats display + epoch poll via block number ---
-        let watchdog = {
-            let stop_flag = Arc::clone(&stop_flag);
-            let attempts_counter = Arc::clone(&attempts_counter);
-            let shutdown = Arc::clone(&shutdown);
-            let provider = provider.clone();
-            let target_epoch = epoch;
-            let round_start = Instant::now();
-            tokio::spawn(async move {
-                let mut last_print = Instant::now();
-                let mut last_attempts: u64 = 0;
-                let mut last_poll = Instant::now();
-                loop {
-                    tokio::time::sleep(Duration::from_millis(500)).await;
-                    if stop_flag.load(Ordering::Relaxed) {
-                        break;
-                    }
-                    if shutdown.load(Ordering::Relaxed) {
-                        stop_flag.store(true, Ordering::Relaxed);
-                        break;
-                    }
-
-                    if last_print.elapsed() >= STATS_INTERVAL {
-                        let total = attempts_counter.load(Ordering::Relaxed);
-                        let delta = total.saturating_sub(last_attempts);
-                        let secs = last_print.elapsed().as_secs_f64().max(0.001);
-                        let rate = delta as f64 / secs;
-                        let elapsed = round_start.elapsed().as_secs_f64();
-                        eprint!(
-                            "\r⚡ {:>10.2} H/s | round {:>6.0}s | attempts {:>14}",
-                            rate, elapsed, total
-                        );
-                        last_attempts = total;
-                        last_print = Instant::now();
-                    }
-
-                    if last_poll.elapsed() >= EPOCH_POLL_INTERVAL {
-                        last_poll = Instant::now();
-                        match provider.get_block_number().await {
-                            Ok(bn) => {
-                                let cur_epoch = bn / EPOCH_BLOCKS;
-                                if cur_epoch != target_epoch {
-                                    eprintln!(
-                                        "\n🔄 Epoch changed {} -> {} (block {}), restarting round",
-                                        target_epoch, cur_epoch, bn
-                                    );
-                                    stop_flag.store(true, Ordering::Relaxed);
-                                    break;
-                                }
-                            }
-                            Err(e) => eprintln!("\n⚠️  block poll failed: {e}"),
-                        }
-                    }
-                }
-            })
-        };
-
-        // --- Mining (GPU if available, else CPU thread pool) ---
-        let mining_result: Option<Solution> = {
-            let stop_flag = Arc::clone(&stop_flag);
-            let attempts_counter = Arc::clone(&attempts_counter);
-
-            #[cfg(feature = "gpu")]
-            {
-                if let Some(g) = gpu_miner.as_ref().cloned() {
-                    let res = tokio::task::spawn_blocking(move || {
-                        g.mine(challenge, difficulty, start_nonce_u64, stop_flag, attempts_counter)
-                    })
-                    .await?;
-                    match res {
-                        Ok(Some(nonce_u64)) => Some(Solution {
-                            nonce: U256::from(nonce_u64),
-                            epoch,
-                        }),
-                        Ok(None) => None,
-                        Err(e) => {
-                            eprintln!("❌ GPU mining error: {e}");
-                            None
-                        }
-                    }
-                } else {
-                    tokio::task::spawn_blocking(move || {
-                        run_workers(
-                            challenge, difficulty, epoch, start_nonce,
-                            stop_flag, attempts_counter, num_threads,
-                        )
-                    })
-                    .await?
-                }
-            }
-
-            #[cfg(not(feature = "gpu"))]
-            {
-                let _ = &gpu_miner; // silence unused
-                tokio::task::spawn_blocking(move || {
-                    run_workers(
-                        challenge, difficulty, epoch, start_nonce,
-                        stop_flag, attempts_counter, num_threads,
-                    )
-                })
-                .await?
-            }
-        };
-
-        stop_flag.store(true, Ordering::Relaxed);
-        let _ = watchdog.await;
-        let round_attempts = attempts_counter.load(Ordering::Relaxed);
-        session_attempts += round_attempts;
-        eprintln!();
-
-        let Some(sol) = mining_result else {
-            continue;
-        };
-
-        println!("🎉 FOUND VALID NONCE: {} (epoch {})", sol.nonce, sol.epoch);
-
-        // --- Gas tuning (EIP-1559) ---
-        // PRIORITY_GWEI: tip you actually pay miners (default 5 gwei — aggressive).
-        // MAX_FEE_GWEI:  absolute ceiling; you only pay this if base_fee spikes.
-        //                Effective gas = min(MAX_FEE, base_fee + PRIORITY).
-        // GAS_LIMIT_OVERRIDE: optional fixed gas limit.
-        let priority_gwei: f64 = std::env::var("PRIORITY_GWEI")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(5.0);
-        let max_fee_gwei: f64 = std::env::var("MAX_FEE_GWEI")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(100.0);
-        let priority_wei = (priority_gwei * 1e9) as u128;
-        let max_fee_wei = (max_fee_gwei * 1e9) as u128;
-
-        let mut tx = contract
-            .mine(sol.nonce)
-            .max_priority_fee_per_gas(priority_wei)
-            .max_fee_per_gas(max_fee_wei);
-        if let Some(g) = std::env::var("GAS_LIMIT_OVERRIDE")
-            .ok()
-            .and_then(|s| s.parse::<u64>().ok())
-        {
-            tx = tx.gas(g);
-        }
-        println!(
-            "💸 Gas: priority={priority_gwei} gwei, maxFee={max_fee_gwei} gwei (ceiling)"
-        );
-
-        match tx.send().await {
-            Ok(pending) => {
-                let tx_hash = *pending.tx_hash();
-                println!("📋 Transaction submitted: {tx_hash}");
-                println!("⏳ Waiting for confirmation...");
-                match pending.with_required_confirmations(1).get_receipt().await {
-                    Ok(receipt) => {
-                        if receipt.status() {
-                            println!(
-                                "✅ SUCCESS! Confirmed in block {}",
-                                receipt.block_number.unwrap_or_default()
-                            );
-                            println!("🔗 https://etherscan.io/tx/{tx_hash}");
-                            success_count += 1;
-                            if let Ok(total_mints) = contract.totalMints().call().await {
-                                println!(
-                                    "🏆 Mined ~{} HASH tokens",
-                                    reward_for_total_mints(total_mints._0)
-                                );
-                                println!(
-                                    "📈 Total successful mints this session: {success_count}"
-                                );
-                            }
-                        } else {
-                            println!("❌ Transaction reverted (status=0)");
-                        }
-                    }
-                    Err(e) => eprintln!("❌ Receipt error: {e}"),
-                }
-            }
-            Err(e) => eprintln!("❌ Submission failed: {e}"),
         }
     }
 
-    let elapsed = session_start.elapsed().as_secs_f64().max(0.001);
-    let rate = session_attempts as f64 / elapsed;
-    println!("\n📊 Final Statistics:");
-    println!("   Total Attempts: {session_attempts}");
-    println!("   Successful Mints: {success_count}");
-    println!("   Average Hash Rate: {rate:.2} H/s");
-    println!("   Mining Duration: {elapsed:.2} seconds");
+    let device_indices = if cfg.gpu_indices.is_empty() {
+        vec![0usize]
+    } else {
+        cfg.gpu_indices.clone()
+    };
+
+    #[cfg(feature = "gpu")]
+    if cfg.gpu {
+        let (sol_tx, mut sol_rx) =
+            tokio::sync::mpsc::unbounded_channel::<SolutionSubmit>();
+        // Submitter consumer task.
+        {
+            let submitter = submitter.clone();
+            let watcher = watcher.clone();
+            tokio::spawn(async move {
+                while let Some(sol) = sol_rx.recv().await {
+                    let Some(state) = watcher.current() else {
+                        tracing::warn!("no state when consuming solution");
+                        continue;
+                    };
+                    match submitter.submit_solution(sol, state).await {
+                        Ok(r) => tracing::info!("submit result: {r:?}"),
+                        Err(e) => tracing::warn!("submit_solution failed: {e}"),
+                    }
+                }
+            });
+        }
+        // Spawn one OS thread per device.
+        let token = watcher.token();
+        let mut handles = Vec::new();
+        for (i, dev_idx) in device_indices.iter().enumerate() {
+            let cfg = cfg.clone();
+            let watcher = watcher.clone();
+            let metrics = metrics.clone();
+            let token = token.clone();
+            let sol_tx = sol_tx.clone();
+            let dev_idx = *dev_idx;
+            let logical_id = (i as u32) + 1;
+            handles.push(std::thread::spawn(move || {
+                if let Err(e) = standalone_device_loop(
+                    cfg, watcher, metrics, token, sol_tx, dev_idx, logical_id,
+                ) {
+                    tracing::error!(device_index = dev_idx, "device loop exited: {e}");
+                }
+            }));
+        }
+        // Print interval summary.
+        {
+            let metrics = metrics.clone();
+            let interval = cfg.print_interval_sec.max(1);
+            tokio::spawn(async move {
+                loop {
+                    tokio::time::sleep(Duration::from_secs(interval)).await;
+                    let total = metrics.attempts.load(Ordering::Relaxed);
+                    tracing::info!(total_attempts = total, "miner heartbeat");
+                }
+            });
+        }
+        for h in handles {
+            let _ = h.join();
+        }
+        return Ok(());
+    }
+
+    // Pure CPU fallback path (no GPU feature or GPU=0).
+    tracing::warn!("running CPU mining fallback (very slow)");
+    cpu_standalone_loop(cfg, watcher, submitter).await
+}
+
+#[cfg(feature = "gpu")]
+fn standalone_device_loop(
+    cfg: AppConfig,
+    watcher: StateWatcher,
+    metrics: Arc<Metrics>,
+    token: Arc<AtomicU64>,
+    sol_tx: tokio::sync::mpsc::UnboundedSender<SolutionSubmit>,
+    dev_idx: usize,
+    logical_id: u32,
+) -> Result<()> {
+    use crate::gpu::{GpuMiner, MineOutcome};
+    use crate::nonce_space::NonceAllocator;
+
+    let mut miner = GpuMiner::new_for_index(
+        dev_idx,
+        Some(cfg.gpu_batch as usize),
+        cfg.auto_tune_batch,
+        cfg.auto_tune_target_ms,
+        cfg.local_size,
+    )?;
+    tracing::info!(
+        device_index = dev_idx,
+        device_name = miner.device_name(),
+        batch = miner.batch_size(),
+        "gpu device ready"
+    );
+    miner.self_test()?;
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let mut allocator: Option<NonceAllocator> = None;
+    let mut snapshot_token = u64::MAX;
+    loop {
+        let state = match watcher.current() {
+            Some(s) => s,
+            None => {
+                std::thread::sleep(Duration::from_millis(200));
+                continue;
+            }
+        };
+        let cur_tok = token.load(Ordering::Relaxed);
+        if snapshot_token != cur_tok || allocator.is_none() {
+            allocator = Some(NonceAllocator::new(
+                &cfg.miner_id,
+                logical_id,
+                state.epoch,
+                &state.challenge,
+            ));
+            snapshot_token = cur_tok;
+            tracing::info!(
+                device_index = dev_idx,
+                epoch = state.epoch,
+                "rebound nonce allocator for new epoch/challenge"
+            );
+        }
+        let alloc = allocator.as_mut().unwrap();
+        let batch = alloc.next_batch(cfg.gpu_batch);
+        let attempts_local = Arc::new(AtomicU64::new(0));
+        let start = Instant::now();
+        let outcome = miner.mine_until(
+            state.challenge,
+            state.effective_target,
+            batch.prefix,
+            batch.base_counter64,
+            stop.clone(),
+            attempts_local.clone(),
+            Some((token.clone(), cur_tok)),
+        )?;
+        let secs = start.elapsed().as_secs_f64().max(0.001);
+        let attempts = attempts_local.load(Ordering::Relaxed);
+        metrics.attempts.fetch_add(attempts, Ordering::Relaxed);
+        let hashrate = attempts as f64 / secs;
+        let device_name = miner.device_name().to_string();
+        metrics.record_device(dev_idx, &device_name, attempts, hashrate);
+        match outcome {
+            MineOutcome::Found { nonce, .. } => {
+                let h = hash_nonce(&state.challenge, nonce);
+                let sol = SolutionSubmit {
+                    worker_id: cfg.miner_id.clone(),
+                    device_id: logical_id,
+                    epoch: state.epoch,
+                    challenge: state.challenge,
+                    nonce,
+                    hash: h,
+                    attempts,
+                    hashrate,
+                    found_at_block: state.block_number,
+                };
+                tracing::info!(
+                    device_index = dev_idx,
+                    nonce = %nonce,
+                    hashrate = format!("{hashrate:.2}"),
+                    "found solution"
+                );
+                if sol_tx.send(sol).is_err() {
+                    tracing::warn!("submitter channel closed; exiting device loop");
+                    return Ok(());
+                }
+            }
+            MineOutcome::Aborted { .. } => {
+                tracing::debug!(device_index = dev_idx, "mining aborted (state changed)");
+            }
+        }
+    }
+}
+
+async fn cpu_standalone_loop(
+    cfg: AppConfig,
+    watcher: StateWatcher,
+    submitter: Arc<Submitter>,
+) -> Result<()> {
+    use crate::contract::hash_below_target;
+    use crate::nonce_space::NonceAllocator;
+    let mut allocator: Option<NonceAllocator> = None;
+    let mut last_token = u64::MAX;
+    let token = watcher.token();
+    loop {
+        let state = match watcher.current() {
+            Some(s) => s,
+            None => {
+                tokio::time::sleep(Duration::from_millis(200)).await;
+                continue;
+            }
+        };
+        let cur_tok = token.load(Ordering::Relaxed);
+        if last_token != cur_tok || allocator.is_none() {
+            allocator = Some(NonceAllocator::new(
+                &cfg.miner_id,
+                1,
+                state.epoch,
+                &state.challenge,
+            ));
+            last_token = cur_tok;
+        }
+        let alloc = allocator.as_mut().unwrap();
+        let batch = alloc.next_batch(cfg.gpu_batch.min(2_000_000));
+        let mut found = None;
+        for i in 0..batch.batch_size {
+            if token.load(Ordering::Relaxed) != cur_tok {
+                break;
+            }
+            let n = batch.pow_nonce(i);
+            let h = hash_nonce(&state.challenge, n);
+            if hash_below_target(&h, state.effective_target) {
+                found = Some((n, h));
+                break;
+            }
+        }
+        if let Some((nonce, hash)) = found {
+            let sol = SolutionSubmit {
+                worker_id: cfg.miner_id.clone(),
+                device_id: 0,
+                epoch: state.epoch,
+                challenge: state.challenge,
+                nonce,
+                hash,
+                attempts: batch.batch_size,
+                hashrate: 0.0,
+                found_at_block: state.block_number,
+            };
+            if let Err(e) = submitter.submit_solution(sol, state).await {
+                tracing::warn!("submit_solution failed: {e}");
+            }
+        }
+    }
+}
+
+async fn run_coordinator(cfg: AppConfig) -> Result<()> {
+    let signer = signer_from_cfg(&cfg)?;
+    let miner = signer.address();
+    let pool = make_pool(&cfg).await?;
+    let db = Db::open(&cfg.sqlite_path)?;
+    let tx_mgr = TxNonceManager::new(miner, &pool, db).await?;
+    let metrics = Arc::new(Metrics::default());
+    let watcher = StateWatcher::new(cfg.clone(), pool.clone(), miner);
+    let submitter = Submitter::new(
+        cfg.clone(),
+        pool.clone(),
+        Some(tx_mgr),
+        Some(signer),
+        miner,
+        metrics.clone(),
+    );
+    println!(
+        "coordinator wallet={miner:#x} contract={:#x} bind={}",
+        cfg.contract, cfg.coordinator_bind
+    );
+    CoordinatorApp::new(cfg, pool, watcher, submitter, metrics)
+        .run()
+        .await
+}
+
+async fn txs(cfg: AppConfig) -> Result<()> {
+    let db = Db::open(&cfg.sqlite_path)?;
+    for tx in db.list_txs()? {
+        println!(
+            "nonce={} status={} hash={} pow_nonce={} epoch={} max_fee={} tip={} gas_limit={}",
+            tx.tx_nonce,
+            tx.status,
+            tx.raw_tx_hash,
+            tx.pow_nonce,
+            tx.epoch,
+            tx.max_fee_per_gas,
+            tx.max_priority_fee_per_gas,
+            tx.gas_limit
+        );
+    }
     Ok(())
 }
+
+async fn doctor(cfg: AppConfig) -> Result<()> {
+    let pool = make_pool(&cfg).await?;
+    println!("chain_id={}", pool.chain_id().await.unwrap_or(0));
+    println!("read_rpc_health={:#?}", pool.read_health().await);
+    println!("submit_rpc_health={:#?}", pool.submit_health().await);
+    if let Ok(signer) = signer_from_cfg(&cfg) {
+        let bal = pool.balance(signer.address()).await.unwrap_or(U256::ZERO);
+        println!("wallet={:#x} balance_wei={bal}", signer.address());
+    } else if let Some(addr) = cfg.miner_address {
+        println!("miner_address={addr:#x} private_key_present=false");
+    }
+    println!(
+        "gas_mode={:?} priority_gwei={} max_fee_cap_gwei={} gas_limit_cap={}",
+        cfg.gas_mode, cfg.priority_gwei, cfg.max_fee_gwei_cap, cfg.gas_limit_cap
+    );
+    println!(
+        "gpu_indices={:?} gpu_batch={} auto_tune={} local_size={}",
+        cfg.gpu_indices, cfg.gpu_batch, cfg.auto_tune_batch, cfg.local_size
+    );
+    devices().await.ok();
+    Ok(())
+}
+
+fn parse_u256(raw: &str) -> Result<U256> {
+    if let Some(hex) = raw.strip_prefix("0x") {
+        Ok(U256::from_str_radix(hex, 16)?)
+    } else {
+        Ok(U256::from_str_radix(raw, 10)?)
+    }
+}
+
+#[allow(dead_code)]
+fn _force_address_used(_a: Address) {}

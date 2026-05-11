@@ -1,10 +1,25 @@
-# Secrets
+# Secrets / per-deployment config
 .env
 .env.local
+.env.worker
+.env.*.local
+
+# Runtime state
+*.sqlite
+*.sqlite-journal
+*.sqlite-wal
+*.sqlite-shm
+*.log
+coordinator.log
+worker.log
 
 # Build artifacts
 /target
 Cargo.lock.bak
+
+# Local planning / scratch
+fitur.txt
+coord
 
 # Vendored binaries derived from system DLLs (regenerate per-machine)
 /vendor/OpenCL.lib
