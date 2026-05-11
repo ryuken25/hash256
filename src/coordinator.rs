@@ -189,6 +189,27 @@ impl CoordinatorApp {
             });
         }
 
+        // Periodic GC of stale worker entries (no heartbeat/work for >5min).
+        // Keeps `workers active=N/N` honest after coordinator restarts.
+        {
+            let workers = self.workers.clone();
+            tokio::spawn(async move {
+                loop {
+                    tokio::time::sleep(Duration::from_secs(60)).await;
+                    let mut g = workers.write().await;
+                    let now = Instant::now();
+                    let before = g.len();
+                    g.retain(|_, info| {
+                        now.duration_since(info.last_seen_at) < Duration::from_secs(300)
+                    });
+                    let after = g.len();
+                    if after < before {
+                        tracing::info!("GC: removed {} stale workers ({} -> {})", before - after, before, after);
+                    }
+                }
+            });
+        }
+
         // Periodic dashboard log: block/epoch + workers active + total hashrate
         // + tx counts. Prints every PRINT_INTERVAL_SEC.
         {
@@ -242,33 +263,29 @@ impl CoordinatorApp {
                         .map(|v| v.len())
                         .unwrap_or(0);
 
-                    println!();
+                    let bar = "─".repeat(72);
+                    println!("\n{bar}");
                     println!(
-                        "📊 block={block} epoch={epoch} blocks_left={blocks_left} challenge={}...",
-                        &challenge[..18.min(challenge.len())]
+                        "📊 block={block} epoch={epoch} [{blocks_left} blocks left]  ⛓ challenge={}…",
+                        &challenge[..14.min(challenge.len())]
                     );
                     println!(
-                        "👷 workers active={active}/{total_workers}  total_hashrate={}",
+                        "👷 workers={active}/{total_workers}  ⚡ total={}  🪙 sol(ok={accepted_sol} bad={rejected_sol} stale={stale_sol})  📤 tx(sent={submitted} ok={confirmed} fail={failed} pend={pending} bump={replaced})",
                         fmt_hashrate(total_hr)
                     );
-                    println!(
-                        "🪙 sol: accepted={accepted_sol} rejected={rejected_sol} stale={stale_sol}"
-                    );
-                    println!(
-                        "📤 tx:  submitted={submitted} confirmed={confirmed} failed={failed} replaced={replaced} pending={pending}"
-                    );
                     if !per_worker.is_empty() {
-                        let mut rows: Vec<String> = per_worker
+                        let mut rows: Vec<(String, f64)> = per_worker
                             .iter()
                             .map(|(id, miner, hr)| {
-                                format!("    {id} ({}) = {}", miner, fmt_hashrate(*hr))
+                                (format!("  {id:>4} {miner:<28}", id=id, miner=miner.chars().take(28).collect::<String>()), *hr)
                             })
                             .collect();
-                        rows.sort();
-                        for r in rows.iter().take(20) {
-                            println!("{r}");
+                        rows.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+                        for (s, hr) in rows.iter().take(20) {
+                            println!("{s} {}", fmt_hashrate(*hr));
                         }
                     }
+                    println!("{bar}");
                 }
             });
         }
@@ -281,6 +298,7 @@ impl CoordinatorApp {
             .route("/solution", post(solution))
             .route("/heartbeat", post(heartbeat))
             .route("/metrics", get(metrics_handler))
+            .route("/workers", get(workers_handler))
             .with_state(self);
         tracing::info!("coordinator listening on {addr}");
         let listener = tokio::net::TcpListener::bind(addr).await?;
@@ -474,6 +492,37 @@ async fn solution(
 
 async fn metrics_handler(State(app): State<CoordinatorApp>) -> String {
     app.metrics.render_full()
+}
+
+async fn workers_handler(State(app): State<CoordinatorApp>) -> Response {
+    let g = app.workers.read().await;
+    let now = Instant::now();
+    let stale_after = Duration::from_secs(60);
+    let mut list: Vec<serde_json::Value> = Vec::new();
+    let mut total_hr = 0.0;
+    let mut active = 0;
+    for w in g.values() {
+        let age = now.duration_since(w.last_seen_at).as_secs();
+        if age <= stale_after.as_secs() {
+            active += 1;
+            total_hr += w.last_hashrate;
+            list.push(serde_json::json!({
+                "id": w.assigned_worker_id,
+                "miner_id": w.miner_id,
+                "device_name": w.device_name,
+                "hashrate": w.last_hashrate,
+                "attempts": w.last_attempts,
+                "age_sec": age,
+            }));
+        }
+    }
+    Json(serde_json::json!({
+        "active": active,
+        "total": g.len(),
+        "total_hashrate": total_hr,
+        "workers": list,
+    }))
+    .into_response()
 }
 
 async fn heartbeat(

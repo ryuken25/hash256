@@ -256,25 +256,24 @@ if [ "$USE_USERSPACE" = "1" ]; then
 fi
 
 cd "$WORK_DIR/hash256"
-setsid nohup bash -c "
-  $PROXY_ENV
-  set -a; . ./.env; set +a
-  exec ./target/release/hash256 worker 2>&1
-" > "$WORK_DIR/hash256/worker.log" 2>&1 < /dev/null &
+chmod +x scripts/*.sh 2>/dev/null
+# Spawn under supervisor so it auto-restarts on crash.
+setsid nohup bash scripts/run_worker_supervised.sh > "$WORK_DIR/hash256/worker.log" 2>&1 < /dev/null &
 disown 2>/dev/null || true
-sleep 5
+sleep 6
 
-WORKER_PID=$(pgrep -f 'target/release/hash256 worker' | head -1)
+WORKER_PID=$(pgrep -x hash256 | head -1)
+SUP_PID=$(pgrep -f run_worker_supervised | head -1)
 if [ -n "$WORKER_PID" ]; then
   echo ""
-  echo "[setup] worker started (pid=$WORKER_PID, nohup)"
+  echo "[setup] worker running (pid=$WORKER_PID, supervisor=$SUP_PID)"
   echo "    tail log  :  tail -f $WORK_DIR/hash256/worker.log"
-  echo "    stop      :  pkill -f 'target/release/hash256 worker'"
+  echo "    stop      :  pkill -f run_worker_supervised; pkill -x hash256"
   echo "    re-run    :  bash $WORK_DIR/hash256/scripts/setup_worker.sh"
   echo ""
-  echo "[setup] last 5 lines of worker log:"
-  tail -5 "$WORK_DIR/hash256/worker.log"
+  echo "[setup] last 6 lines of worker log:"
+  tail -6 "$WORK_DIR/hash256/worker.log"
 else
-  echo "[setup] WARNING: worker process not found after 5s. Check $WORK_DIR/hash256/worker.log"
+  echo "[setup] WARNING: worker process not found after 6s. Check $WORK_DIR/hash256/worker.log"
   tail -20 "$WORK_DIR/hash256/worker.log"
 fi
