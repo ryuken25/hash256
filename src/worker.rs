@@ -348,7 +348,9 @@ async fn run_device_loop(
         let attempts_local = Arc::new(AtomicU64::new(0));
         let start = Instant::now();
 
-        // Periodic hashrate printer for this round.
+        // Periodic hashrate printer + global_attempts feeder.
+        // Without this, global_attempts only updates AFTER mine_until returns
+        // (could be hours on hard targets), making heartbeat report 0 H/s.
         let printer_stop = Arc::new(AtomicBool::new(false));
         {
             let attempts = attempts_local.clone();
@@ -356,7 +358,9 @@ async fn run_device_loop(
             let interval = Duration::from_secs(cfg.print_interval_sec.max(1));
             let prefix_p = prefix.clone();
             let started = start;
+            let printer_global = global_attempts.clone();
             tokio::spawn(async move {
+                let mut last_n = 0u64;
                 loop {
                     tokio::time::sleep(interval).await;
                     if stop.load(Ordering::Relaxed) {
@@ -364,6 +368,9 @@ async fn run_device_loop(
                     }
                     let secs = started.elapsed().as_secs_f64().max(0.001);
                     let n = attempts.load(Ordering::Relaxed);
+                    let delta = n.saturating_sub(last_n);
+                    printer_global.fetch_add(delta, Ordering::Relaxed);
+                    last_n = n;
                     let hps = n as f64 / secs;
                     println!(
                         "{prefix_p}⚡ {} | round {:>5}s | attempts {:>15}",
@@ -398,9 +405,8 @@ async fn run_device_loop(
 
         let secs = start.elapsed().as_secs_f64().max(0.001);
         let attempts = attempts_local.load(Ordering::Relaxed);
-        // Feed global counter so heartbeat task can compute aggregate hashrate.
-        global_attempts.fetch_add(attempts, Ordering::Relaxed);
         let hashrate = attempts as f64 / secs;
+        // Note: global_attempts already kept up-to-date by the printer task above.
 
         match outcome {
             MineOutcome::Found { nonce, .. } => {
