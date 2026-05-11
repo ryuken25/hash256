@@ -68,6 +68,14 @@ pub fn mine_calldata(pow_nonce: U256) -> Vec<u8> {
     HashToken::mineCall { nonce: pow_nonce }.abi_encode()
 }
 
+pub fn mining_state_calldata() -> Vec<u8> {
+    HashToken::miningStateCall {}.abi_encode()
+}
+
+pub fn get_challenge_calldata(miner: Address) -> Vec<u8> {
+    HashToken::getChallengeCall { miner }.abi_encode()
+}
+
 pub fn hex_b256(v: &B256) -> String {
     format!("0x{}", hex::encode(v.as_slice()))
 }

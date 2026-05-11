@@ -10,7 +10,10 @@ use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::{json, Value};
 use tokio::sync::RwLock;
 
-use crate::{config::parse_urls, contract::MiningStateView};
+use crate::{
+    config::parse_urls,
+    contract::{get_challenge_calldata, mining_state_calldata, MiningStateView},
+};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RpcHealth {
@@ -299,27 +302,30 @@ impl RpcPool {
     }
 
     pub async fn mining_state(&self, contract: Address) -> Result<MiningStateView> {
-        let data = "0x392e6678";
+        let data = mining_state_calldata();
         let raw: String = self
             .call(
                 "eth_call",
-                json!([{ "to": format!("{contract:#x}"), "data": data, "gas": "0x30d40" }, "latest"]),
+                json!([{
+                    "to": format!("{contract:#x}"),
+                    "data": format!("0x{}", hex::encode(&data)),
+                    "gas": "0x30d40"
+                }, "latest"]),
             )
             .await?;
         decode_mining_state(&raw)
     }
 
     pub async fn get_challenge(&self, contract: Address, miner: Address) -> Result<B256> {
-        let selector_hash = alloy::primitives::keccak256("getChallenge(address)".as_bytes());
-        let selector = &selector_hash.as_slice()[..4];
-        let mut data = Vec::with_capacity(36);
-        data.extend_from_slice(selector);
-        data.extend_from_slice(&[0u8; 12]);
-        data.extend_from_slice(miner.as_slice());
+        let data = get_challenge_calldata(miner);
         let raw: String = self
             .call(
                 "eth_call",
-                json!([{ "to": format!("{contract:#x}"), "data": format!("0x{}", hex::encode(data)), "gas": "0x30d40" }, "latest"]),
+                json!([{
+                    "to": format!("{contract:#x}"),
+                    "data": format!("0x{}", hex::encode(&data)),
+                    "gas": "0x30d40"
+                }, "latest"]),
             )
             .await?;
         let bytes = hex::decode(raw.trim_start_matches("0x"))?;
