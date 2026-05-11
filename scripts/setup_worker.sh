@@ -47,26 +47,40 @@ if ! command -v tailscale >/dev/null 2>&1; then
   curl -fsSL https://tailscale.com/install.sh | sh
 fi
 
-systemctl start tailscaled 2>/dev/null || true
-if ! pgrep -x tailscaled >/dev/null 2>&1; then
-  mkdir -p /var/lib/tailscale /var/run/tailscale
-  # Start tailscaled detached so it survives this shell exiting (vast.ai
-  # / runpod containers usually don't have systemd).
-  setsid nohup tailscaled \
-    --state=/var/lib/tailscale/tailscaled.state \
-    --socket=/var/run/tailscale/tailscaled.sock \
-    > /tmp/tailscaled.log 2>&1 < /dev/null &
-  disown 2>/dev/null || true
-  # Wait for socket to appear
-  for i in 1 2 3 4 5 6 7 8 9 10; do
-    [ -S /var/run/tailscale/tailscaled.sock ] && break
-    sleep 1
-  done
+# Detect whether /dev/net/tun is usable (vast.ai / runpod containers usually
+# do not expose it, so we have to use Tailscale userspace networking with a
+# local HTTP proxy that the worker reqwest client picks up via HTTP_PROXY).
+USE_USERSPACE=0
+if [ ! -e /dev/net/tun ]; then
+  USE_USERSPACE=1
 fi
+
+# Kill any prior tailscaled that may have started without the right flags.
+pkill -9 tailscaled 2>/dev/null || true
+sleep 1
+mkdir -p /var/lib/tailscale /var/run/tailscale
+
+TS_FLAGS=(
+  "--state=/var/lib/tailscale/tailscaled.state"
+  "--socket=/var/run/tailscale/tailscaled.sock"
+)
+if [ "$USE_USERSPACE" = "1" ]; then
+  echo "[setup] /dev/net/tun unavailable -> using Tailscale userspace networking + HTTP proxy on :1055"
+  TS_FLAGS+=("--tun=userspace-networking")
+  TS_FLAGS+=("--socks5-server=localhost:1055")
+  TS_FLAGS+=("--outbound-http-proxy-listen=localhost:1055")
+fi
+
+setsid nohup tailscaled "${TS_FLAGS[@]}" > /tmp/tailscaled.log 2>&1 < /dev/null &
+disown 2>/dev/null || true
+for i in 1 2 3 4 5 6 7 8 9 10; do
+  [ -S /var/run/tailscale/tailscaled.sock ] && break
+  sleep 1
+done
+
 if ! pgrep -x tailscaled >/dev/null 2>&1; then
-  echo "WARNING: tailscaled belum jalan. Coba manual:"
-  echo "  setsid nohup tailscaled --state=/var/lib/tailscale/tailscaled.state \\"
-  echo "    --socket=/var/run/tailscale/tailscaled.sock > /tmp/tailscaled.log 2>&1 &"
+  echo "ERROR: tailscaled belum jalan. Cek /tmp/tailscaled.log"
+  tail -20 /tmp/tailscaled.log 2>/dev/null || true
 fi
 
 echo ""
@@ -209,8 +223,14 @@ echo "============================================================="
 # Kill session lama kalau ada supaya bisa re-run skrip dengan aman.
 screen -S hash256-worker -X quit 2>/dev/null || true
 
+PROXY_ENV=""
+if [ "$USE_USERSPACE" = "1" ]; then
+  PROXY_ENV="export HTTP_PROXY=http://localhost:1055; export HTTPS_PROXY=http://localhost:1055; export ALL_PROXY=socks5://localhost:1055;"
+  echo "[setup] worker akan pakai HTTP proxy localhost:1055 (Tailscale userspace mode)"
+fi
+
 screen -dmS hash256-worker bash -lc \
-  "cd $WORK_DIR/hash256 && set -a && . ./.env && set +a && ./target/release/hash256 worker 2>&1 | tee -a worker.log"
+  "cd $WORK_DIR/hash256 && $PROXY_ENV set -a && . ./.env && set +a && ./target/release/hash256 worker 2>&1 | tee -a worker.log"
 
 sleep 1
 screen -ls || true
