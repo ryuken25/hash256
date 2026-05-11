@@ -58,6 +58,7 @@ pub async fn run_worker(cfg: AppConfig) -> Result<()> {
     println!("   Coordinator : {}", cfg.coordinator_url);
     println!("   Miner addr  : {}", cfg.miner_address.map(|a| format!("{a:#x}")).unwrap_or_else(|| "<none>".into()));
 
+    let worker_id = Arc::new(tokio::sync::RwLock::new(reg.assigned_worker_id));
     let device_indices = if cfg.gpu_indices.is_empty() {
         vec![0usize]
     } else {
@@ -67,12 +68,13 @@ pub async fn run_worker(cfg: AppConfig) -> Result<()> {
     for (i, dev_idx) in device_indices.iter().enumerate() {
         let cfg = cfg.clone();
         let client = client.clone();
-        let worker_id = reg.assigned_worker_id.clone();
+        let worker_id = worker_id.clone();
+        let host = host.clone();
         let dev_idx = *dev_idx;
         let logical_id = i as u32 + 1;
         let multi = device_indices.len() > 1;
         handles.push(tokio::spawn(async move {
-            if let Err(e) = run_device_loop(cfg, client, worker_id, dev_idx, logical_id, multi).await {
+            if let Err(e) = run_device_loop(cfg, client, worker_id, host, dev_idx, logical_id, multi).await {
                 eprintln!("❌ device {dev_idx} loop exited: {e}");
             }
         }));
@@ -81,6 +83,11 @@ pub async fn run_worker(cfg: AppConfig) -> Result<()> {
         let _ = h.await;
     }
     Ok(())
+}
+
+fn is_404_or_unknown_worker(e: &eyre::Report) -> bool {
+    let m = e.to_string().to_lowercase();
+    m.contains("404") || m.contains("unknown worker")
 }
 
 async fn retry_register(
@@ -158,7 +165,8 @@ fn fmt_hashrate(hps: f64) -> String {
 async fn run_device_loop(
     cfg: AppConfig,
     client: Client,
-    worker_id: String,
+    worker_id: Arc<tokio::sync::RwLock<String>>,
+    host: String,
     dev_idx: usize,
     logical_id: u32,
     multi_gpu: bool,
@@ -191,10 +199,12 @@ async fn run_device_loop(
     let watch_token = Arc::new(AtomicU64::new(0));
 
     // Background poller: bumps watch_token when challenge/epoch changes upstream.
+    // Uses shared worker_id (so it sees re-registrations from main loop).
+    // Suppresses 404 chatter (main loop is responsible for re-registering).
     let poll_token = watch_token.clone();
     let poll_client = client.clone();
     let poll_cfg = cfg.clone();
-    let poll_worker = worker_id.clone();
+    let poll_worker_id = worker_id.clone();
     let last_challenge_arc = Arc::new(std::sync::Mutex::new(String::new()));
     let last_epoch_arc = Arc::new(std::sync::Mutex::new(0u64));
     let lc1 = last_challenge_arc.clone();
@@ -203,7 +213,8 @@ async fn run_device_loop(
     tokio::spawn(async move {
         loop {
             tokio::time::sleep(Duration::from_millis(poll_cfg.state_check_interval_ms.max(200))).await;
-            match fetch_work(&poll_client, &poll_cfg, &poll_worker).await {
+            let wid = poll_worker_id.read().await.clone();
+            match fetch_work(&poll_client, &poll_cfg, &wid).await {
                 Ok(w) => {
                     let mut lc = lc1.lock().unwrap();
                     let mut le = le1.lock().unwrap();
@@ -214,7 +225,9 @@ async fn run_device_loop(
                     }
                 }
                 Err(e) => {
-                    println!("{prefix_p}⚠️  block poll failed: {e}");
+                    if !is_404_or_unknown_worker(&e) {
+                        println!("{prefix_p}⚠️  block poll failed: {e}");
+                    }
                 }
             }
         }
@@ -222,8 +235,24 @@ async fn run_device_loop(
 
     let mut last_seen_epoch: Option<u64> = None;
     loop {
-        let work = match fetch_work(&client, &cfg, &worker_id).await {
+        let wid = worker_id.read().await.clone();
+        let work = match fetch_work(&client, &cfg, &wid).await {
             Ok(w) => w,
+            Err(e) if is_404_or_unknown_worker(&e) => {
+                println!("{prefix}⚠️  worker_id '{wid}' unknown to coordinator (likely restarted) — re-registering");
+                match retry_register(&client, &cfg, &host).await {
+                    Ok(new_reg) => {
+                        let new_id = new_reg.assigned_worker_id.clone();
+                        println!("{prefix}✅ Re-registered as '{new_id}' (namespace {}...)", &new_reg.nonce_prefix_namespace[..18.min(new_reg.nonce_prefix_namespace.len())]);
+                        *worker_id.write().await = new_id;
+                    }
+                    Err(e) => {
+                        println!("{prefix}❌ re-register failed: {e}");
+                        tokio::time::sleep(Duration::from_secs(3)).await;
+                    }
+                }
+                continue;
+            }
             Err(e) => {
                 println!("{prefix}⚠️  fetch work failed: {e}");
                 tokio::time::sleep(Duration::from_secs(2)).await;
@@ -354,7 +383,7 @@ async fn run_device_loop(
                     fmt_hashrate(hashrate)
                 );
                 let sol = SolutionSubmit {
-                    worker_id: worker_id.clone(),
+                    worker_id: worker_id.read().await.clone(),
                     device_id: logical_id,
                     epoch: work.epoch,
                     challenge,
@@ -396,7 +425,8 @@ async fn run_device_loop(
 async fn run_device_loop(
     cfg: AppConfig,
     client: Client,
-    worker_id: String,
+    worker_id: Arc<tokio::sync::RwLock<String>>,
+    host: String,
     dev_idx: usize,
     logical_id: u32,
     _multi_gpu: bool,
@@ -405,8 +435,16 @@ async fn run_device_loop(
         "⚠️  binary built without `gpu` feature; using CPU fallback (very slow), device_index={dev_idx}"
     );
     loop {
-        let work = match fetch_work(&client, &cfg, &worker_id).await {
+        let wid = worker_id.read().await.clone();
+        let work = match fetch_work(&client, &cfg, &wid).await {
             Ok(w) => w,
+            Err(e) if is_404_or_unknown_worker(&e) => {
+                println!("⚠️  worker_id stale, re-registering");
+                if let Ok(new_reg) = retry_register(&client, &cfg, &host).await {
+                    *worker_id.write().await = new_reg.assigned_worker_id;
+                }
+                continue;
+            }
             Err(e) => {
                 println!("⚠️  fetch_work: {e}");
                 tokio::time::sleep(Duration::from_secs(2)).await;
@@ -433,7 +471,7 @@ async fn run_device_loop(
         let secs = start.elapsed().as_secs_f64().max(0.001);
         if let Some((nonce, h)) = found {
             let sol = SolutionSubmit {
-                worker_id: worker_id.clone(),
+                worker_id: worker_id.read().await.clone(),
                 device_id: logical_id,
                 epoch: work.epoch,
                 challenge,
