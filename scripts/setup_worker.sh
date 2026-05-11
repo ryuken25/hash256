@@ -146,8 +146,8 @@ if command -v nvidia-smi >/dev/null 2>&1; then
 fi
 [ "$GPU_COUNT" -lt 1 ] && GPU_COUNT=1
 
-# Default per device
-GPU_BATCH=67108864
+# Default per device. Auto-tune will further adjust based on dispatch time.
+GPU_BATCH=33554432
 case "$(echo "$GPU_NAME" | tr '[:upper:]' '[:lower:]')" in
   *5090*)         GPU_BATCH=134217728 ;;
   *5080*)         GPU_BATCH=67108864 ;;

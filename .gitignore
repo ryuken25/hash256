@@ -20,6 +20,8 @@ Cargo.lock.bak
 # Local planning / scratch
 fitur.txt
 coord
+workerlist
+workerbadlist
 
 # Vendored binaries derived from system DLLs (regenerate per-machine)
 /vendor/OpenCL.lib
