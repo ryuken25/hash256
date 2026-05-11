@@ -5,7 +5,7 @@ use std::{
         atomic::{AtomicU64, Ordering},
         Arc,
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use axum::{
@@ -46,12 +46,19 @@ pub struct CoordinatorApp {
 struct WorkerInfo {
     #[allow(dead_code)]
     assigned_worker_id: String,
-    #[allow(dead_code)]
     miner_id: String,
     device_name: String,
     allocator: NonceAllocator,
     last_attempts: u64,
     last_hashrate: f64,
+    last_seen_at: Instant,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct HeartbeatRequest {
+    pub worker_id: String,
+    pub hashrate: f64,
+    pub attempts: u64,
 }
 
 #[derive(Default)]
@@ -182,12 +189,97 @@ impl CoordinatorApp {
             });
         }
 
+        // Periodic dashboard log: block/epoch + workers active + total hashrate
+        // + tx counts. Prints every PRINT_INTERVAL_SEC.
+        {
+            let workers = self.workers.clone();
+            let latest = self.latest.clone();
+            let metrics = self.metrics.clone();
+            let db_opt = self.submitter.db();
+            let interval = Duration::from_secs(self.cfg.print_interval_sec.max(5));
+            tokio::spawn(async move {
+                let stale_after = Duration::from_secs(60);
+                loop {
+                    tokio::time::sleep(interval).await;
+                    let now = Instant::now();
+                    let workers_g = workers.read().await;
+                    let mut active = 0usize;
+                    let mut total_hr = 0f64;
+                    let mut per_worker: Vec<(String, String, f64)> = Vec::new();
+                    for (id, info) in workers_g.iter() {
+                        if now.duration_since(info.last_seen_at) <= stale_after {
+                            active += 1;
+                            total_hr += info.last_hashrate;
+                            per_worker.push((
+                                id.clone(),
+                                info.miner_id.clone(),
+                                info.last_hashrate,
+                            ));
+                        }
+                    }
+                    let total_workers = workers_g.len();
+                    drop(workers_g);
+
+                    let state = latest.read().await.clone();
+                    let block = state.as_ref().map(|s| s.block_number).unwrap_or(0);
+                    let epoch = state.as_ref().map(|s| s.epoch).unwrap_or(0);
+                    let blocks_left = state.as_ref().map(|s| s.blocks_left).unwrap_or(0);
+                    let challenge = state
+                        .as_ref()
+                        .map(|s| hex_b256(&s.challenge))
+                        .unwrap_or_default();
+
+                    let submitted = metrics.submitted_txs.load(Ordering::Relaxed);
+                    let confirmed = metrics.confirmations.load(Ordering::Relaxed);
+                    let failed = metrics.failures.load(Ordering::Relaxed);
+                    let accepted_sol = metrics.accepted_solutions.load(Ordering::Relaxed);
+                    let rejected_sol = metrics.rejected_solutions.load(Ordering::Relaxed);
+                    let stale_sol = metrics.stale_solutions.load(Ordering::Relaxed);
+                    let replaced = metrics.replacements.load(Ordering::Relaxed);
+                    let pending = db_opt
+                        .as_ref()
+                        .and_then(|d| d.list_pending().ok())
+                        .map(|v| v.len())
+                        .unwrap_or(0);
+
+                    println!();
+                    println!(
+                        "📊 block={block} epoch={epoch} blocks_left={blocks_left} challenge={}...",
+                        &challenge[..18.min(challenge.len())]
+                    );
+                    println!(
+                        "👷 workers active={active}/{total_workers}  total_hashrate={}",
+                        fmt_hashrate(total_hr)
+                    );
+                    println!(
+                        "🪙 sol: accepted={accepted_sol} rejected={rejected_sol} stale={stale_sol}"
+                    );
+                    println!(
+                        "📤 tx:  submitted={submitted} confirmed={confirmed} failed={failed} replaced={replaced} pending={pending}"
+                    );
+                    if !per_worker.is_empty() {
+                        let mut rows: Vec<String> = per_worker
+                            .iter()
+                            .map(|(id, miner, hr)| {
+                                format!("    {id} ({}) = {}", miner, fmt_hashrate(*hr))
+                            })
+                            .collect();
+                        rows.sort();
+                        for r in rows.iter().take(20) {
+                            println!("{r}");
+                        }
+                    }
+                }
+            });
+        }
+
         let addr: SocketAddr = self.cfg.coordinator_bind.parse()?;
         let app = Router::new()
             .route("/health", get(health))
             .route("/register", post(register))
             .route("/work", get(work))
             .route("/solution", post(solution))
+            .route("/heartbeat", post(heartbeat))
             .route("/metrics", get(metrics_handler))
             .with_state(self);
         tracing::info!("coordinator listening on {addr}");
@@ -264,6 +356,7 @@ async fn register(
         allocator,
         last_attempts: 0,
         last_hashrate: 0.0,
+        last_seen_at: Instant::now(),
     };
     app.workers.write().await.insert(id.clone(), info);
     tracing::info!(worker = %id, namespace = %ns, "worker registered");
@@ -290,6 +383,7 @@ async fn work(
     let Some(w) = workers.get_mut(&q.worker_id) else {
         return (StatusCode::NOT_FOUND, "unknown worker").into_response();
     };
+    w.last_seen_at = Instant::now();
     // Re-seed allocator on epoch change so prefix carries fresh epoch hash.
     if w.allocator.epoch_changed(state.epoch, &state.challenge) {
         w.allocator.rebind_epoch(state.epoch, &state.challenge);
@@ -328,6 +422,7 @@ async fn solution(
         if let Some(w) = workers.get_mut(&sol.worker_id) {
             w.last_attempts = sol.attempts;
             w.last_hashrate = sol.hashrate;
+            w.last_seen_at = Instant::now();
         }
     }
     let key = format!(
@@ -379,4 +474,37 @@ async fn solution(
 
 async fn metrics_handler(State(app): State<CoordinatorApp>) -> String {
     app.metrics.render_full()
+}
+
+async fn heartbeat(
+    State(app): State<CoordinatorApp>,
+    headers: HeaderMap,
+    Json(req): Json<HeartbeatRequest>,
+) -> Response {
+    if !app.auth(&headers) {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    let mut workers = app.workers.write().await;
+    if let Some(w) = workers.get_mut(&req.worker_id) {
+        w.last_hashrate = req.hashrate;
+        w.last_attempts = req.attempts;
+        w.last_seen_at = Instant::now();
+        StatusCode::OK.into_response()
+    } else {
+        (StatusCode::NOT_FOUND, "unknown worker").into_response()
+    }
+}
+
+fn fmt_hashrate(hps: f64) -> String {
+    if hps >= 1e12 {
+        format!("{:.2} TH/s", hps / 1e12)
+    } else if hps >= 1e9 {
+        format!("{:.2} GH/s", hps / 1e9)
+    } else if hps >= 1e6 {
+        format!("{:.2} MH/s", hps / 1e6)
+    } else if hps >= 1e3 {
+        format!("{:.2} kH/s", hps / 1e3)
+    } else {
+        format!("{hps:.0} H/s")
+    }
 }

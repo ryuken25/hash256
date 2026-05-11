@@ -64,6 +64,35 @@ pub async fn run_worker(cfg: AppConfig) -> Result<()> {
     } else {
         cfg.gpu_indices.clone()
     };
+    // Total attempts counter shared across all device threads on this worker.
+    let global_attempts = Arc::new(AtomicU64::new(0));
+    let global_started = Instant::now();
+
+    // Heartbeat task: posts current hashrate to coordinator every 5s so the
+    // central dashboard can show live aggregate hashrate even between solutions.
+    {
+        let cfg = cfg.clone();
+        let client = client.clone();
+        let worker_id = worker_id.clone();
+        let attempts = global_attempts.clone();
+        tokio::spawn(async move {
+            let url = format!("{}/heartbeat", cfg.coordinator_url.trim_end_matches('/'));
+            loop {
+                tokio::time::sleep(Duration::from_secs(5)).await;
+                let n = attempts.load(Ordering::Relaxed);
+                let secs = global_started.elapsed().as_secs_f64().max(0.001);
+                let hps = n as f64 / secs;
+                let wid = worker_id.read().await.clone();
+                let body = serde_json::json!({
+                    "worker_id": wid,
+                    "hashrate": hps,
+                    "attempts": n,
+                });
+                let _ = authed(client.post(&url), &cfg).json(&body).send().await;
+            }
+        });
+    }
+
     let mut handles = Vec::new();
     for (i, dev_idx) in device_indices.iter().enumerate() {
         let cfg = cfg.clone();
@@ -73,8 +102,9 @@ pub async fn run_worker(cfg: AppConfig) -> Result<()> {
         let dev_idx = *dev_idx;
         let logical_id = i as u32 + 1;
         let multi = device_indices.len() > 1;
+        let global_attempts = global_attempts.clone();
         handles.push(tokio::spawn(async move {
-            if let Err(e) = run_device_loop(cfg, client, worker_id, host, dev_idx, logical_id, multi).await {
+            if let Err(e) = run_device_loop(cfg, client, worker_id, host, dev_idx, logical_id, multi, global_attempts).await {
                 eprintln!("❌ device {dev_idx} loop exited: {e}");
             }
         }));
@@ -170,6 +200,7 @@ async fn run_device_loop(
     dev_idx: usize,
     logical_id: u32,
     multi_gpu: bool,
+    global_attempts: Arc<AtomicU64>,
 ) -> Result<()> {
     use crate::gpu::{GpuMiner, MineOutcome};
 
@@ -367,6 +398,8 @@ async fn run_device_loop(
 
         let secs = start.elapsed().as_secs_f64().max(0.001);
         let attempts = attempts_local.load(Ordering::Relaxed);
+        // Feed global counter so heartbeat task can compute aggregate hashrate.
+        global_attempts.fetch_add(attempts, Ordering::Relaxed);
         let hashrate = attempts as f64 / secs;
 
         match outcome {
@@ -434,6 +467,7 @@ async fn run_device_loop(
     dev_idx: usize,
     logical_id: u32,
     _multi_gpu: bool,
+    _global_attempts: Arc<AtomicU64>,
 ) -> Result<()> {
     println!(
         "⚠️  binary built without `gpu` feature; using CPU fallback (very slow), device_index={dev_idx}"
