@@ -225,7 +225,11 @@ async fn run_device_loop(
                     }
                 }
                 Err(e) => {
-                    if !is_404_or_unknown_worker(&e) {
+                    if is_404_or_unknown_worker(&e) {
+                        // Bump token so the mining loop aborts and main loop
+                        // can hit fetch_work, detect 404, and re-register.
+                        poll_token.fetch_add(1, Ordering::Relaxed);
+                    } else {
                         println!("{prefix_p}⚠️  block poll failed: {e}");
                     }
                 }
